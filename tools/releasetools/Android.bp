@@ -537,6 +537,7 @@ python_binary_host {
     srcs: [
         "sign_target_files_apks.py",
         "ota_from_raw_img.py",
+        "yrrp_signing_profile.py",
     ],
     libs: [
         "releasetools_add_img_to_target_files",
@@ -602,6 +603,7 @@ python_defaults {
         "sign_apex.py",
         "sign_target_files_apks.py",
         "validate_target_files.py",
+        "yrrp_signing_profile.py",
         "merge_ota.py",
         ":releasetools_merge_sources",
         ":releasetools_merge_tests",
