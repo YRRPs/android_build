@@ -16,12 +16,16 @@
 
 """Unit tests for yrrp_signing_profile."""
 
+import contextlib
+import io
 import json
 import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
+from unittest import mock
 
 import yrrp_signing_profile as profiler
 
@@ -92,6 +96,105 @@ class TimelineTest(unittest.TestCase):
         check=True)
     self.profile.finish(ok=True)
     self.assertGreater(self.timeline()[0]["cpu_children_s"], 0.05)
+
+
+class OutputTest(unittest.TestCase):
+
+  def setUp(self):
+    self.temp = tempfile.TemporaryDirectory()
+    self.dir = os.path.join(self.temp.name, "profile")
+
+  def tearDown(self):
+    self.temp.cleanup()
+
+  def path(self, name):
+    return os.path.join(self.dir, name)
+
+  def run_profile(self):
+    profile = profiler.start(
+        environ={profiler.ENV_VAR: self.dir}, interval_s=0.01)
+    profile.mark("work")
+    sum(i * i for i in range(200000))
+    time.sleep(0.05)
+    profile.finish(ok=True)
+    return profile
+
+  def test_sampler_writes_samples_and_stops(self):
+    profile = self.run_profile()
+    samples = read_jsonl(self.path("samples.jsonl"))
+    self.assertGreaterEqual(len(samples), 2)
+    self.assertEqual(
+        set(samples[0]),
+        {"t_s", "rss_kb", "swap_kb", "tmp_used_bytes", "minflt", "majflt"})
+    self.assertGreater(samples[0]["rss_kb"], 0)
+    self.assertFalse(profile._sampler.is_alive())
+
+  def test_finish_writes_profile_top_and_summary_once(self):
+    profile = self.run_profile()
+    for name in ("signing.prof", "signing-top.txt", "summary.json"):
+      self.assertGreater(os.path.getsize(self.path(name)), 0, name)
+    with open(self.path("summary.json")) as handle:
+      summary = json.load(handle)
+    self.assertEqual(
+        set(summary),
+        {"nproc", "python", "wall_s", "steps", "peak_rss_kb",
+         "peak_swap_kb", "peak_tmp_used_bytes", "tmp_dir"})
+    self.assertEqual([s["step"] for s in summary["steps"]], ["work"])
+    self.assertGreater(summary["peak_rss_kb"], 0)
+    with open(self.path("signing-top.txt")) as handle:
+      text = handle.read()
+    self.assertIn("by self time", text)
+    self.assertIn("by cumulative time", text)
+    os.remove(self.path("summary.json"))
+    profile.finish(ok=True)
+    self.assertFalse(os.path.exists(self.path("summary.json")))
+
+  def test_unwritable_directory_warns_once_and_goes_noop(self):
+    blocker = os.path.join(self.temp.name, "file")
+    with open(blocker, "w") as handle:
+      handle.write("x")
+    stderr = io.StringIO()
+    with contextlib.redirect_stderr(stderr):
+      profile = profiler.start(
+          environ={profiler.ENV_VAR: os.path.join(blocker, "profile")})
+      profile.mark("a")
+      profile.finish(ok=True)
+    self.assertIsInstance(profile, profiler.NoopProfile)
+    self.assertEqual(
+        stderr.getvalue().count("YRRP signing profile disabled"), 1)
+
+  def test_write_failure_mid_run_warns_once_and_signing_continues(self):
+    stderr = io.StringIO()
+    with contextlib.redirect_stderr(stderr):
+      profile = profiler.start(
+          environ={profiler.ENV_VAR: self.dir}, interval_s=0.01)
+      broken = mock.MagicMock()
+      broken.write.side_effect = OSError("disk full")
+      profile._timeline = broken
+      profile.mark("a")
+      profile.mark("b")
+      profile.mark("c")
+      profile.finish(ok=True)
+    self.assertEqual(
+        stderr.getvalue().count("YRRP signing profile disabled"), 1)
+
+
+class FinishActiveTest(unittest.TestCase):
+
+  def test_finish_active_inside_failing_finally_marks_not_ok(self):
+    with tempfile.TemporaryDirectory() as root:
+      directory = os.path.join(root, "profile")
+      with self.assertRaises(ValueError):
+        try:
+          profiler.start(environ={profiler.ENV_VAR: directory}).mark("boom")
+          raise ValueError("signing failed")
+        finally:
+          profiler.finish_active()
+      step = read_jsonl(os.path.join(directory, "timeline.jsonl"))[0]
+      self.assertEqual((step["step"], step["ok"]), ("boom", False))
+
+  def test_finish_active_without_start_does_nothing(self):
+    profiler.finish_active()
 
 
 if __name__ == "__main__":
