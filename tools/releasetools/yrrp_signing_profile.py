@@ -20,8 +20,8 @@ Set YRRP_SIGNING_PROFILE_DIR to a directory to record a step timeline,
 resource samples every second, and a cProfile dump there. When the variable is
 unset, every call is a no-op and signing behaves exactly as upstream.
 
-Profiling never fails signing: an OSError prints one warning to stderr and
-stops the profile from writing anything more.
+Profiling never fails signing: any error inside the profiler prints one
+warning to stderr and stops the profile from writing anything more.
 """
 
 import cProfile
@@ -150,40 +150,59 @@ class Profile(object):
     self._sampler = threading.Thread(
         target=self._sample_loop, args=(interval_s,),
         name="yrrp-signing-sampler", daemon=True)
-    self._sampler.start()
     self._profiler = cProfile.Profile()
     try:
       self._profiler.enable()
     except ValueError as error:  # Another profiler already runs.
       _warn(error)
       self._profiler = None
+    try:
+      self._sampler.start()
+    except BaseException:
+      self._release()
+      raise
+
+  def _release(self):
+    """Disables cProfile and closes both files, warning on any error."""
+    if self._profiler is not None:
+      self._profiler.disable()
+    for handle in (self._timeline, self._samples):
+      try:
+        handle.close()
+      except Exception as error:  # pylint: disable=broad-except
+        self._fail(error)
 
   def _path(self, name):
     return os.path.join(self.directory, name)
 
   def mark(self, name):
     """Ends the running step as ok and starts the step called name."""
-    self._close_step(ok=True)
-    self._open_step = (name, _snapshot())
+    if self._broken:
+      return
+    try:
+      self._close_step(ok=True)
+      self._open_step = (name, _snapshot())
+    except Exception as error:  # pylint: disable=broad-except
+      self._fail(error)
 
   def finish(self, ok=True):
     """Ends the running step with ok and writes the outputs once."""
     if self._finished:
       return
     self._finished = True
-    if self._profiler is not None:
-      self._profiler.disable()
-    self._close_step(ok=ok)
-    self._stop.set()
-    self._sampler.join()
     try:
+      if self._profiler is not None:
+        self._profiler.disable()
+      if not self._broken:
+        self._close_step(ok=ok)
+      self._stop.set()
+      self._sampler.join(timeout=10)
       if not self._broken:
         self._write_outputs()
-    except OSError as error:
+    except Exception as error:  # pylint: disable=broad-except
       self._fail(error)
     finally:
-      self._timeline.close()
-      self._samples.close()
+      self._release()
 
   def _write_outputs(self):
     if self._profiler is not None:
@@ -202,7 +221,7 @@ class Profile(object):
     try:
       handle.write(json.dumps(record) + "\n")
       handle.flush()
-    except OSError as error:
+    except Exception as error:  # pylint: disable=broad-except
       self._fail(error)
 
   def _write_text(self, name, text):
@@ -220,8 +239,11 @@ class Profile(object):
     self._append(self._timeline, record)
 
   def _sample_loop(self, interval_s):
-    while True:
-      self._sample()
+    while not self._broken:
+      try:
+        self._sample()
+      except Exception as error:  # pylint: disable=broad-except
+        self._fail(error)
       if self._stop.wait(interval_s):
         return
 
@@ -272,7 +294,7 @@ def start(environ=None, interval_s=SAMPLE_INTERVAL_S):
   if directory:
     try:
       profile = Profile(directory, interval_s)
-    except OSError as error:
+    except Exception as error:  # pylint: disable=broad-except
       _warn(error)
   _active = profile
   return profile
@@ -282,5 +304,9 @@ def finish_active():
   """Finishes the profile from start(); not ok while an exception unwinds."""
   global _active
   profile, _active = _active, None
-  if profile is not None:
+  if profile is None:
+    return
+  try:
     profile.finish(ok=sys.exc_info()[0] is None)
+  except Exception as error:  # pylint: disable=broad-except
+    _warn(error)

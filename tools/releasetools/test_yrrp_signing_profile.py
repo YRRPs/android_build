@@ -91,8 +91,9 @@ class TimelineTest(unittest.TestCase):
 
   def test_child_cpu_is_counted(self):
     self.profile.mark("busy-child")
+    # Not sys.executable: inside releasetools_test that is the test binary.
     subprocess.run(
-        [sys.executable, "-c", "sum(i * i for i in range(3000000))"],
+        ["sh", "-c", "i=0; while [ $i -lt 300000 ]; do i=$((i+1)); done"],
         check=True)
     self.profile.finish(ok=True)
     self.assertGreater(self.timeline()[0]["cpu_children_s"], 0.05)
@@ -174,6 +175,47 @@ class OutputTest(unittest.TestCase):
       profile.mark("a")
       profile.mark("b")
       profile.mark("c")
+      profile.finish(ok=True)
+    self.assertEqual(
+        stderr.getvalue().count("YRRP signing profile disabled"), 1)
+
+  def test_full_disk_at_close_never_escapes_finish_active(self):
+    stderr = io.StringIO()
+    with contextlib.redirect_stderr(stderr):
+      profile = profiler.start(
+          environ={profiler.ENV_VAR: self.dir}, interval_s=0.01)
+      profile._timeline.close()
+      profile._timeline = open("/dev/full", "w")
+      profile.mark("a")
+      profile.mark("b")
+      profiler.finish_active()
+    self.assertIn("YRRP signing profile disabled", stderr.getvalue())
+    self.assertTrue(profile._samples.closed)
+
+  def test_sampler_thread_start_failure_gives_noop(self):
+    stderr = io.StringIO()
+    with contextlib.redirect_stderr(stderr), mock.patch.object(
+        profiler.threading.Thread, "start",
+        side_effect=RuntimeError("can't start new thread")):
+      profile = profiler.start(environ={profiler.ENV_VAR: self.dir})
+    self.assertIsInstance(profile, profiler.NoopProfile)
+    self.assertEqual(
+        stderr.getvalue().count("YRRP signing profile disabled"), 1)
+    # The failed profile released cProfile, so a new one can start.
+    second = profiler.start(
+        environ={profiler.ENV_VAR: self.dir}, interval_s=0.01)
+    self.assertIsInstance(second, profiler.Profile)
+    second.finish(ok=True)
+
+  def test_unexpected_error_in_mark_never_escapes(self):
+    stderr = io.StringIO()
+    with contextlib.redirect_stderr(stderr):
+      profile = profiler.start(
+          environ={profiler.ENV_VAR: self.dir}, interval_s=0.01)
+      with mock.patch.object(
+          profiler, "_snapshot", side_effect=RuntimeError("boom")):
+        profile.mark("a")
+        profile.mark("b")
       profile.finish(ok=True)
     self.assertEqual(
         stderr.getvalue().count("YRRP signing profile disabled"), 1)
