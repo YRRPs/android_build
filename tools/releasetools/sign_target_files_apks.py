@@ -195,6 +195,7 @@ import apex_utils
 import common
 import payload_signer
 import update_payload
+import yrrp_signing_profile  # YRRP: opt-in signing profile
 from payload_signer import SignOtaPackage, PAYLOAD_BIN
 
 
@@ -1855,6 +1856,8 @@ def main(argv):
     sys.exit(1)
 
   common.InitLogging()
+  profile = yrrp_signing_profile.start()  # YRRP
+  profile.mark("load-keys")  # YRRP
 
   input_zip = zipfile.ZipFile(args[0], "r", allowZip64=True)
   output_zip = zipfile.ZipFile(args[1], "w",
@@ -1888,14 +1891,17 @@ def main(argv):
   platform_api_level, _ = GetApiLevelAndCodename(input_zip)
   codename_to_api_level_map = GetCodenameToApiLevelMap(input_zip)
 
+  profile.mark("process-target-files")  # YRRP
   ProcessTargetFiles(input_zip, output_zip, misc_info,
                      apk_keys, apex_keys, key_passwords,
                      platform_api_level, codename_to_api_level_map,
                      compressed_extension)
 
+  profile.mark("zip-close")  # YRRP
   common.ZipClose(input_zip)
   common.ZipClose(output_zip)
 
+  profile.mark("add-img-to-target-files")  # YRRP
   if OPTIONS.vendor_partitions and OPTIONS.vendor_otatools:
     BuildVendorPartitions(args[1])
 
@@ -1915,4 +1921,5 @@ if __name__ == '__main__':
   try:
     main(sys.argv[1:])
   finally:
+    yrrp_signing_profile.finish_active()  # YRRP
     common.Cleanup()
