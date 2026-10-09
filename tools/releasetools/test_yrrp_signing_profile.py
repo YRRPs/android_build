@@ -16,7 +16,10 @@
 
 """Unit tests for yrrp_signing_profile."""
 
+import json
 import os
+import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -37,6 +40,58 @@ class NoopProfileTest(unittest.TestCase):
         os.chdir(cwd)
       self.assertIsInstance(profile, profiler.NoopProfile)
       self.assertEqual(os.listdir(root), [])
+
+
+STEP_FIELDS = {
+    "step", "ok", "wall_s", "cpu_self_s", "cpu_children_s",
+    "maxrss_self_kb", "maxrss_children_kb", "minflt", "majflt",
+    "read_bytes", "write_bytes", "nvcsw", "nivcsw",
+}
+
+
+def read_jsonl(path):
+  with open(path) as handle:
+    return [json.loads(line) for line in handle]
+
+
+class TimelineTest(unittest.TestCase):
+
+  def setUp(self):
+    self.temp = tempfile.TemporaryDirectory()
+    self.dir = os.path.join(self.temp.name, "profile")
+    self.profile = profiler.start(
+        environ={profiler.ENV_VAR: self.dir}, interval_s=0.01)
+
+  def tearDown(self):
+    self.profile.finish(ok=True)
+    self.temp.cleanup()
+
+  def timeline(self):
+    return read_jsonl(os.path.join(self.dir, "timeline.jsonl"))
+
+  def test_marks_record_each_step_with_every_field(self):
+    self.profile.mark("first")
+    self.profile.mark("second")
+    self.profile.finish(ok=True)
+    steps = self.timeline()
+    self.assertEqual([s["step"] for s in steps], ["first", "second"])
+    self.assertTrue(all(s["ok"] for s in steps))
+    for step in steps:
+      self.assertEqual(set(step), STEP_FIELDS)
+
+  def test_failed_finish_marks_last_step_not_ok(self):
+    self.profile.mark("only")
+    self.profile.finish(ok=False)
+    self.assertEqual(
+        [(s["step"], s["ok"]) for s in self.timeline()], [("only", False)])
+
+  def test_child_cpu_is_counted(self):
+    self.profile.mark("busy-child")
+    subprocess.run(
+        [sys.executable, "-c", "sum(i * i for i in range(3000000))"],
+        check=True)
+    self.profile.finish(ok=True)
+    self.assertGreater(self.timeline()[0]["cpu_children_s"], 0.05)
 
 
 if __name__ == "__main__":
